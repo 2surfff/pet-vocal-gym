@@ -1,15 +1,33 @@
-"""Асинхронний шар роботи з SQLite (aiosqlite) для Vocal Gym."""
+"""Асинхронний шар роботи з SQLite (aiosqlite) та захистом квоти Gemini API."""
 
 import json
+import os
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
 
-from backend.schemas import SessionCreateRequest
+from backend.schemas import (
+    GeneratedExerciseSchema,
+    SessionCreateRequest,
+    VocalAnalysisResponse,
+)
 
 DB_PATH = Path(__file__).resolve().parent.parent / "vocal_gym.db"
+
+
+class DailyQuotaExceededError(Exception):
+    """Піднімається, коли денний ліміт запитів до Gemini API вичерпано."""
+
+
+def get_daily_ai_limit() -> int:
+    """Повертає максимальну кількість AI-запитів на день із .env (за замовчуванням 15)."""
+    raw = os.getenv("DAILY_AI_LIMIT", "15")
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 15
 
 
 async def init_db() -> None:
@@ -55,6 +73,30 @@ async def init_db() -> None:
             )
             """
         )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS voice_profiles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                voice_type TEXT NOT NULL,
+                vocal_range TEXT NOT NULL,
+                passaggio_zone TEXT NOT NULL,
+                tension_detected INTEGER NOT NULL,
+                tension_analysis TEXT NOT NULL,
+                tips_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_usage_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                endpoint TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
         await db.commit()
 
 
@@ -80,6 +122,153 @@ async def get_all_exercises() -> list[dict[str, Any]]:
             }
         )
     return exercises
+
+
+async def get_ai_requests_today() -> int:
+    """Повертає кількість AI-запитів, виконаних за поточну дату (UTC)."""
+    today_str = datetime.now(timezone.utc).date().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM ai_usage_logs WHERE substr(created_at, 1, 10) = ?",
+            (today_str,),
+        )
+        row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
+
+async def enforce_daily_ai_limit() -> tuple[int, int]:
+    """Перевіряє, чи не перевищено денний ліміт AI-запитів перед викликом Gemini."""
+    limit = get_daily_ai_limit()
+    used = await get_ai_requests_today()
+    if used >= limit:
+        raise DailyQuotaExceededError(f"Денний ліміт AI-запитів ({limit}/день) вичерпано")
+    return used, limit
+
+
+async def log_ai_usage(endpoint: str, model_name: str) -> int:
+    """Фіксує успішний виклик Gemini API у таблиці ai_usage_logs."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO ai_usage_logs (endpoint, model_name, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (endpoint, model_name, now_iso),
+        )
+        await db.commit()
+    return await get_ai_requests_today()
+
+
+async def save_voice_profile(analysis: VocalAnalysisResponse) -> dict[str, Any]:
+    """Зберігає аналіз голосу у таблицю voice_profiles."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    tips_json = json.dumps(analysis.tips, ensure_ascii=False)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            INSERT INTO voice_profiles (
+                voice_type,
+                vocal_range,
+                passaggio_zone,
+                tension_detected,
+                tension_analysis,
+                tips_json,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                analysis.voice_type,
+                analysis.vocal_range,
+                analysis.passaggio_zone,
+                1 if analysis.tension_detected else 0,
+                analysis.tension_analysis,
+                tips_json,
+                now_iso,
+            ),
+        )
+        profile_id = cursor.lastrowid
+        await db.commit()
+
+    return {
+        "id": profile_id,
+        "voice_type": analysis.voice_type,
+        "vocal_range": analysis.vocal_range,
+        "passaggio_zone": analysis.passaggio_zone,
+        "tension_detected": analysis.tension_detected,
+        "tension_analysis": analysis.tension_analysis,
+        "tips": analysis.tips,
+        "created_at": now_iso,
+    }
+
+
+async def get_latest_voice_profile() -> dict[str, Any] | None:
+    """Повертає останній збережений профіль голосу або None."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT
+                id,
+                voice_type,
+                vocal_range,
+                passaggio_zone,
+                tension_detected,
+                tension_analysis,
+                tips_json,
+                created_at
+            FROM voice_profiles
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        )
+        row = await cursor.fetchone()
+
+    if row is None:
+        return None
+
+    return {
+        "id": int(row["id"]),
+        "voice_type": row["voice_type"],
+        "vocal_range": row["vocal_range"],
+        "passaggio_zone": row["passaggio_zone"],
+        "tension_detected": bool(row["tension_detected"]),
+        "tension_analysis": row["tension_analysis"],
+        "tips": json.loads(row["tips_json"]),
+        "created_at": row["created_at"],
+    }
+
+
+async def save_generated_exercise(generated: GeneratedExerciseSchema) -> dict[str, Any]:
+    """Зберігає згенеровану AI вправу в таблицю exercises та повертає її з ID."""
+    notes_payload = [item.model_dump() for item in generated.notes]
+    notes_json = json.dumps(notes_payload, ensure_ascii=False)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            INSERT INTO exercises (title, description, difficulty, bpm, notes_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                generated.title,
+                generated.description,
+                generated.difficulty,
+                generated.bpm,
+                notes_json,
+            ),
+        )
+        exercise_id = cursor.lastrowid
+        await db.commit()
+
+    return {
+        "id": exercise_id,
+        "title": generated.title,
+        "description": generated.description,
+        "difficulty": generated.difficulty,
+        "bpm": generated.bpm,
+        "notes": notes_payload,
+    }
 
 
 async def _calculate_streak_days(db: aiosqlite.Connection) -> int:
@@ -117,7 +306,6 @@ async def save_session(payload: SessionCreateRequest) -> dict[str, Any]:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA foreign_keys = ON;")
 
-        # Перевіряємо існування вправи
         ex_cursor = await db.execute(
             "SELECT id FROM exercises WHERE id = ?",
             (payload.exercise_id,),
@@ -178,7 +366,7 @@ async def save_session(payload: SessionCreateRequest) -> dict[str, Any]:
 
 
 async def get_stats() -> dict[str, Any]:
-    """Повертає загальний XP, стрік, кількість сесій і топ найпроблемніших нот."""
+    """Повертає загальний XP, стрік, кількість сесій, проблемні ноти та AI-ліміт."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
 
@@ -205,6 +393,9 @@ async def get_stats() -> dict[str, Any]:
         )
         note_rows = await notes_cursor.fetchall()
 
+    ai_requests_today = await get_ai_requests_today()
+    ai_daily_limit = get_daily_ai_limit()
+
     return {
         "total_xp": int(summary["total_xp"]) if summary else 0,
         "streak_days": streak_days,
@@ -219,4 +410,6 @@ async def get_stats() -> dict[str, Any]:
             }
             for row in note_rows
         ],
+        "ai_requests_today": ai_requests_today,
+        "ai_daily_limit": ai_daily_limit,
     }

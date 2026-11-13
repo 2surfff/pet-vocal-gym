@@ -31,6 +31,13 @@
             <span class="stat-label">Сесій</span>
             <strong id="stat-sessions" class="stat-value">0</strong>
           </div>
+          <div class="stat-pill">
+            <span class="stat-label">AI-ліміт</span>
+            <strong id="stat-ai-quota" class="stat-value">0 / 15 сьогодні</strong>
+          </div>
+          <button id="btn-open-ai-coach" type="button" class="btn btn-ai">
+            Діагностика голосу (AI-коуч)
+          </button>
         </div>
       </header>
 
@@ -43,6 +50,23 @@
 
       <main class="studio-layout">
         <aside class="sidebar">
+          <div class="ai-generator-box">
+            <div class="ai-generator-header">
+              <h3>Згенерувати AI-розспівку</h3>
+              <span id="sidebar-ai-quota" class="ai-quota-hint">AI-ліміт: 0 / 15 сьогодні</span>
+            </div>
+            <input
+              id="ai-goal-input"
+              type="text"
+              class="ai-input"
+              placeholder="Ціль: напр., згладити перехід E4–G4"
+              maxlength="240"
+            />
+            <button id="btn-generate-exercise" type="button" class="btn btn-ai btn-full">
+              Згенерувати AI-розспівку
+            </button>
+          </div>
+
           <div class="panel-header">
             <h2>Розспівки</h2>
             <span class="panel-hint">Оберіть вправу</span>
@@ -196,7 +220,54 @@
         </div>
 
         <div class="modal-actions">
+          <button id="modal-ai-analyze-btn" type="button" class="btn btn-ai">
+            Розібрати дубль через Gemini 4
+          </button>
           <button id="modal-retry-btn" type="button" class="btn btn-primary">Повторити вправу</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="ai-coach-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="ai-coach-modal-title">
+      <div class="modal-card modal-card-wide">
+        <div class="modal-header">
+          <div>
+            <h2 id="ai-coach-modal-title">Діагностика голосу (AI-коуч · Gemini 4)</h2>
+            <p class="modal-subtitle">Запишіть до 25 секунд співу або розспівки для розбору тембру, опори та затисків</p>
+          </div>
+          <button id="ai-coach-close-btn" type="button" class="btn-icon" aria-label="Закрити">✕</button>
+        </div>
+
+        <div class="coach-recorder-box">
+          <input
+            id="ai-coach-context"
+            type="text"
+            class="ai-input"
+            placeholder="Контекст (необов'язково): напр., сирена на «нг» або верхні ноти G4"
+            maxlength="240"
+          />
+
+          <div class="coach-recorder-controls">
+            <button id="btn-coach-record" type="button" class="btn btn-secondary">
+              Записати дубль (до 25 с)
+            </button>
+            <span id="coach-timer-badge" class="coach-timer-badge">25s</span>
+            <button id="btn-coach-analyze" type="button" class="btn btn-ai" disabled>
+              Розібрати через Gemini 4 Argon
+            </button>
+          </div>
+
+          <div class="coach-progress-track">
+            <div id="coach-record-progress" class="coach-progress-fill"></div>
+          </div>
+
+          <audio id="coach-audio-preview" class="coach-audio-preview" controls hidden></audio>
+        </div>
+
+        <div id="voice-profile-card" class="voice-profile-card">
+          <div class="voice-profile-empty">
+            Останній вокальний профіль ще не створено. Запишіть фрагмент (до 25 с) або натисніть «Розібрати дубль через Gemini 4» після вправи.
+          </div>
         </div>
       </div>
     </div>

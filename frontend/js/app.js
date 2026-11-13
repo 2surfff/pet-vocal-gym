@@ -1,9 +1,10 @@
 /**
  * Головний контролер стану Vocal Gym (ES6 Module).
  *
- * Зв'язує бекенд API (/api/exercises, /api/sessions, /api/stats),
- * YIN-детектор висоти тону (pitch_detector.js), синтезатор (synth.js)
- * та візуалізатор на Canvas (visualizer.js).
+ * Зв'язує бекенд API (/api/exercises, /api/sessions, /api/stats, /api/voice-analyze,
+ * /api/voice-profile/latest, /api/exercises/generate),
+ * YIN-детектор висоти тону (pitch_detector.js), синтезатор (synth.js),
+ * візуалізатор на Canvas (visualizer.js) та MediaRecorder (ліміт <= 25 с).
  */
 
 import {
@@ -19,6 +20,17 @@ import {
   getEventTargetMidiAtTime,
 } from "./synth.js";
 import { PitchVisualizer, getAccuracyColor } from "./visualizer.js";
+
+const MAX_RECORDING_SEC = 25;
+
+function pickSupportedRecorderMimeType() {
+  if (typeof MediaRecorder === "undefined") return "";
+  const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"];
+  for (const type of candidates) {
+    if (MediaRecorder.isTypeSupported(type)) return type;
+  }
+  return "";
+}
 
 class VocalGymApp {
   constructor() {
@@ -47,12 +59,36 @@ class VocalGymApp {
     this.sessionFrameScores = [];
     this.sessionFrameCents = [];
 
+    // MediaRecorder для фонового запису вправи (макс. 25с)
+    this.bgRecorder = null;
+    this.bgAudioChunks = [];
+    this.bgAutoStopTimer = null;
+    this.lastSessionAudioBlob = null;
+    this.lastSessionContext = "";
+
+    // MediaRecorder для модального вікна «Діагностика голосу (AI-коуч)»
+    this.coachRecorder = null;
+    this.coachStream = null;
+    this.coachOwnsStream = false;
+    this.coachAudioChunks = [];
+    this.coachAutoStopTimer = null;
+    this.coachTickInterval = null;
+    this.coachAudioBlob = null;
+    this.coachPreviewUrl = null;
+    this.isCoachRecording = false;
+    this.latestProfile = null;
+
     this.dom = {
       totalXp: document.getElementById("stat-total-xp"),
       streakDays: document.getElementById("stat-streak"),
       sessionsCount: document.getElementById("stat-sessions"),
+      aiQuotaHeader: document.getElementById("stat-ai-quota"),
+      aiQuotaSidebar: document.getElementById("sidebar-ai-quota"),
       problematicNotesList: document.getElementById("problematic-notes-list"),
       exerciseList: document.getElementById("exercise-list"),
+      aiGoalInput: document.getElementById("ai-goal-input"),
+      btnGenerateExercise: document.getElementById("btn-generate-exercise"),
+      btnOpenAiCoach: document.getElementById("btn-open-ai-coach"),
       exerciseTitle: document.getElementById("active-exercise-title"),
       exerciseDesc: document.getElementById("active-exercise-desc"),
       exerciseBpm: document.getElementById("meta-bpm"),
@@ -81,16 +117,26 @@ class VocalGymApp {
       tunerCents: document.getElementById("tuner-cents"),
       tunerBarIndicator: document.getElementById("tuner-bar-indicator"),
       targetNoteBadge: document.getElementById("target-note-badge"),
-      sessionProgressFill: document.createElement ? document.getElementById("session-progress-fill") : null,
+      sessionProgressFill: document.getElementById("session-progress-fill"),
       canvas: document.getElementById("pitch-canvas"),
       modal: document.getElementById("results-modal"),
       modalClose: document.getElementById("modal-close-btn"),
       modalRetry: document.getElementById("modal-retry-btn"),
+      modalAiAnalyzeBtn: document.getElementById("modal-ai-analyze-btn"),
       resScore: document.getElementById("result-score"),
       resCents: document.getElementById("result-cents"),
       resXp: document.getElementById("result-xp"),
       resTotalXp: document.getElementById("result-total-xp"),
       resNotesBreakdown: document.getElementById("result-notes-breakdown"),
+      aiCoachModal: document.getElementById("ai-coach-modal"),
+      aiCoachCloseBtn: document.getElementById("ai-coach-close-btn"),
+      aiCoachContext: document.getElementById("ai-coach-context"),
+      btnCoachRecord: document.getElementById("btn-coach-record"),
+      coachTimerBadge: document.getElementById("coach-timer-badge"),
+      coachRecordProgress: document.getElementById("coach-record-progress"),
+      coachAudioPreview: document.getElementById("coach-audio-preview"),
+      btnCoachAnalyze: document.getElementById("btn-coach-analyze"),
+      voiceProfileCard: document.getElementById("voice-profile-card"),
       toast: document.getElementById("status-toast"),
     };
   }
@@ -101,7 +147,11 @@ class VocalGymApp {
     this._syncNoiseGateUI(this.detector.rmsThreshold);
     this._syncTransposeUI();
 
-    await Promise.all([this.loadExercises(), this.loadStats()]);
+    await Promise.all([
+      this.loadExercises(),
+      this.loadStats(),
+      this.loadLatestVoiceProfile(),
+    ]);
     this._startRenderLoop();
   }
 
@@ -123,14 +173,27 @@ class VocalGymApp {
       this._syncNoiseGateUI(val);
     });
     this.dom.btnStartStop.addEventListener("click", () => this.toggleSession());
+
+    // Результати сесії
     this.dom.modalClose.addEventListener("click", () => this.closeModal());
     this.dom.modalRetry.addEventListener("click", () => {
       this.closeModal();
       this.startSession();
     });
+    this.dom.modalAiAnalyzeBtn.addEventListener("click", () => this.analyzeLastSessionTake());
     this.dom.modal.addEventListener("click", (e) => {
       if (e.target === this.dom.modal) this.closeModal();
     });
+
+    // AI-коуч та генерація вправ
+    this.dom.btnGenerateExercise.addEventListener("click", () => this.generateAiExercise());
+    this.dom.btnOpenAiCoach.addEventListener("click", () => this.openAiCoachModal());
+    this.dom.aiCoachCloseBtn.addEventListener("click", () => this.closeAiCoachModal());
+    this.dom.aiCoachModal.addEventListener("click", (e) => {
+      if (e.target === this.dom.aiCoachModal) this.closeAiCoachModal();
+    });
+    this.dom.btnCoachRecord.addEventListener("click", () => this.toggleCoachRecording());
+    this.dom.btnCoachAnalyze.addEventListener("click", () => this.analyzeCoachRecording());
 
     window.addEventListener("resize", () => {
       if (this.visualizer) {
@@ -142,7 +205,6 @@ class VocalGymApp {
   _syncNoiseGateUI(threshold) {
     this.dom.sliderNoiseGate.value = threshold.toFixed(3);
     this.dom.noiseGateValue.textContent = threshold.toFixed(3);
-    // Індикатор RMS розрахований на шкалу 0..0.25
     const markerPct = Math.min(100, Math.max(0, (threshold / 0.25) * 100));
     this.dom.rmsGateMarker.style.left = `${markerPct}%`;
   }
@@ -207,7 +269,7 @@ class VocalGymApp {
     clearTimeout(this._toastTimer);
     this._toastTimer = setTimeout(() => {
       toast.classList.remove("visible");
-    }, 3400);
+    }, 3600);
   }
 
   async loadExercises() {
@@ -216,7 +278,7 @@ class VocalGymApp {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       this.exercises = await res.json();
       this._renderExerciseList();
-      if (this.exercises.length > 0) {
+      if (this.exercises.length > 0 && !this.selectedExercise) {
         this.selectExercise(this.exercises[0]);
       }
     } catch (err) {
@@ -235,10 +297,38 @@ class VocalGymApp {
     }
   }
 
+  async loadLatestVoiceProfile() {
+    try {
+      const res = await fetch("/api/voice-profile/latest");
+      if (!res.ok) return;
+      const profile = await res.json();
+      if (profile) {
+        this.latestProfile = profile;
+        this._renderVoiceProfile(profile);
+      }
+    } catch {
+      // Ігноруємо на старті, якщо профілю ще немає
+    }
+  }
+
+  _updateAiQuotaDisplay(used, limit) {
+    const label = `${used} / ${limit} сьогодні`;
+    if (this.dom.aiQuotaHeader) {
+      this.dom.aiQuotaHeader.textContent = label;
+    }
+    if (this.dom.aiQuotaSidebar) {
+      this.dom.aiQuotaSidebar.textContent = `AI-ліміт: ${label}`;
+    }
+  }
+
   _renderStats(stats) {
     this.dom.totalXp.textContent = `${stats.total_xp} XP`;
     this.dom.streakDays.textContent = `${stats.streak_days} дн.`;
     this.dom.sessionsCount.textContent = String(stats.sessions_count);
+
+    const used = stats.ai_requests_today ?? 0;
+    const limit = stats.ai_daily_limit ?? 15;
+    this._updateAiQuotaDisplay(used, limit);
 
     const container = this.dom.problematicNotesList;
     container.innerHTML = "";
@@ -343,7 +433,6 @@ class VocalGymApp {
     }
 
     try {
-      // Вмикаємо апаратне ехо- та шумозаглушення, щоб мікрофон не ловив звук піаніно з динаміків
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
@@ -392,6 +481,62 @@ class VocalGymApp {
     }
   }
 
+  /**
+   * Запускає фоновий MediaRecorder під час вправи з жорстким автостопом на 25-й секунді.
+   */
+  _startBackgroundTakeRecording() {
+    this.lastSessionAudioBlob = null;
+    this.bgAudioChunks = [];
+    clearTimeout(this.bgAutoStopTimer);
+
+    const stream = this.detector?.mediaStream;
+    if (!stream || typeof MediaRecorder === "undefined") {
+      return;
+    }
+
+    try {
+      const mimeType = pickSupportedRecorderMimeType();
+      const recorder = mimeType
+        ? new MediaRecorder(stream, { mimeType })
+        : new MediaRecorder(stream);
+
+      this.bgRecorder = recorder;
+      recorder.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) {
+          this.bgAudioChunks.push(ev.data);
+        }
+      };
+      recorder.onstop = () => {
+        clearTimeout(this.bgAutoStopTimer);
+        if (this.bgAudioChunks.length > 0) {
+          this.lastSessionAudioBlob = new Blob(this.bgAudioChunks, {
+            type: recorder.mimeType || mimeType || "audio/webm",
+          });
+        }
+      };
+
+      recorder.start(500);
+      this.bgAutoStopTimer = setTimeout(() => {
+        if (this.bgRecorder && this.bgRecorder.state === "recording") {
+          this.bgRecorder.stop();
+        }
+      }, MAX_RECORDING_SEC * 1000);
+    } catch {
+      this.bgRecorder = null;
+    }
+  }
+
+  _stopBackgroundTakeRecording() {
+    clearTimeout(this.bgAutoStopTimer);
+    if (this.bgRecorder && this.bgRecorder.state === "recording") {
+      try {
+        this.bgRecorder.stop();
+      } catch {
+        // Ігноруємо, якщо вже зупинений
+      }
+    }
+  }
+
   async toggleSession() {
     if (this.isSessionActive) {
       this.stopSession(false);
@@ -420,6 +565,12 @@ class VocalGymApp {
     this.dom.btnStartStop.textContent = "Стоп";
     this.dom.btnStartStop.classList.add("danger");
 
+    if (this.isMicEnabled) {
+      this._startBackgroundTakeRecording();
+    } else {
+      this.lastSessionAudioBlob = null;
+    }
+
     try {
       this.currentTimeline = await this.synth.startExercise(this.selectedExercise, {
         transposeSemitones: this.transposeSemitones,
@@ -436,6 +587,7 @@ class VocalGymApp {
       });
       this.visualizer.setTimeline(this.currentTimeline);
     } catch (err) {
+      this._stopBackgroundTakeRecording();
       this.isSessionActive = false;
       this.dom.btnStartStop.textContent = "Старт вправи";
       this.dom.btnStartStop.classList.remove("danger");
@@ -446,6 +598,7 @@ class VocalGymApp {
   stopSession(completed = false) {
     this.isSessionActive = false;
     this.synth.stop();
+    this._stopBackgroundTakeRecording();
     this.dom.btnStartStop.textContent = "Старт вправи";
     this.dom.btnStartStop.classList.remove("danger");
     this.dom.sessionProgressFill.style.width = completed ? "100%" : "0%";
@@ -495,6 +648,8 @@ class VocalGymApp {
       }
     }
 
+    this.lastSessionContext = `Вправа «${this.selectedExercise.title}» (${this.currentBpm} BPM, транспозиція ${this.transposeSemitones} пт). Автоматична точність: ${Math.round(scorePercent)}%, середнє відхилення ±${avgCentsOff.toFixed(1)}¢.`;
+
     try {
       const res = await fetch("/api/sessions", {
         method: "POST",
@@ -521,6 +676,9 @@ class VocalGymApp {
     this.dom.resXp.textContent = `+${saved.xp_earned} XP`;
     this.dom.resTotalXp.textContent = `${saved.total_xp} XP (Стрік: ${saved.streak_days} дн.)`;
 
+    // Кнопка AI-розбору активна, якщо під час вправи був записаний живий мікрофон
+    this.dom.modalAiAnalyzeBtn.disabled = !this.isMicEnabled && !this.lastSessionAudioBlob;
+
     const list = this.dom.resNotesBreakdown;
     list.innerHTML = "";
     for (const nr of noteResults) {
@@ -543,9 +701,298 @@ class VocalGymApp {
     this.dom.modal.classList.remove("open");
   }
 
-  /**
-   * Симулює голос у Демо-режимі (підтримує як рівні ноти, так і глісандо slide_to).
-   */
+  // ---------------------------------------------------------------------------
+  // Етап 2: Діагностика голосу (AI-коуч, MediaRecorder <= 25 с) та генератор
+  // ---------------------------------------------------------------------------
+
+  openAiCoachModal() {
+    if (this.latestProfile) {
+      this._renderVoiceProfile(this.latestProfile);
+    }
+    this.dom.aiCoachModal.classList.add("open");
+  }
+
+  closeAiCoachModal() {
+    if (this.isCoachRecording) {
+      this._stopCoachRecording();
+    }
+    this.dom.aiCoachModal.classList.remove("open");
+  }
+
+  async toggleCoachRecording() {
+    if (this.isCoachRecording) {
+      this._stopCoachRecording();
+    } else {
+      await this._startCoachRecording();
+    }
+  }
+
+  async _startCoachRecording() {
+    if (typeof MediaRecorder === "undefined") {
+      this.showToast("Ваш браузер не підтримує MediaRecorder для запису аудіо.", true);
+      return;
+    }
+
+    try {
+      let stream = this.detector?.mediaStream;
+      this.coachOwnsStream = false;
+      if (!stream) {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: false,
+          },
+        });
+        this.coachOwnsStream = true;
+      }
+      this.coachStream = stream;
+    } catch (err) {
+      this.showToast(`Не вдалося увімкнути мікрофон для запису: ${err.message}`, true);
+      return;
+    }
+
+    this.coachAudioChunks = [];
+    this.coachAudioBlob = null;
+    this.dom.btnCoachAnalyze.disabled = true;
+    this.dom.coachAudioPreview.hidden = true;
+
+    const mimeType = pickSupportedRecorderMimeType();
+    const recorder = mimeType
+      ? new MediaRecorder(this.coachStream, { mimeType })
+      : new MediaRecorder(this.coachStream);
+    this.coachRecorder = recorder;
+
+    recorder.ondataavailable = (ev) => {
+      if (ev.data && ev.data.size > 0) {
+        this.coachAudioChunks.push(ev.data);
+      }
+    };
+
+    recorder.onstop = () => {
+      clearTimeout(this.coachAutoStopTimer);
+      clearInterval(this.coachTickInterval);
+      this.isCoachRecording = false;
+      this.dom.btnCoachRecord.textContent = "Записати дубль (до 25 с)";
+      this.dom.btnCoachRecord.classList.remove("danger");
+      this.dom.coachTimerBadge.classList.remove("recording");
+
+      if (this.coachOwnsStream && this.coachStream) {
+        this.coachStream.getTracks().forEach((t) => t.stop());
+        this.coachStream = null;
+      }
+
+      if (this.coachAudioChunks.length > 0) {
+        this.coachAudioBlob = new Blob(this.coachAudioChunks, {
+          type: recorder.mimeType || mimeType || "audio/webm",
+        });
+        if (this.coachPreviewUrl) {
+          URL.revokeObjectURL(this.coachPreviewUrl);
+        }
+        this.coachPreviewUrl = URL.createObjectURL(this.coachAudioBlob);
+        this.dom.coachAudioPreview.src = this.coachPreviewUrl;
+        this.dom.coachAudioPreview.hidden = false;
+        this.dom.btnCoachAnalyze.disabled = false;
+        this.showToast("Запис готовий до аналізу через Gemini 4 Argon.");
+      }
+    };
+
+    const startedAt = Date.now();
+    this.isCoachRecording = true;
+    this.dom.btnCoachRecord.textContent = "Зупинити запис";
+    this.dom.btnCoachRecord.classList.add("danger");
+    this.dom.coachTimerBadge.classList.add("recording");
+    this.dom.coachTimerBadge.textContent = `${MAX_RECORDING_SEC}s`;
+    this.dom.coachRecordProgress.style.width = "0%";
+
+    recorder.start(250);
+
+    this.coachTickInterval = setInterval(() => {
+      const elapsedSec = (Date.now() - startedAt) / 1000;
+      const remaining = Math.max(0, Math.ceil(MAX_RECORDING_SEC - elapsedSec));
+      const pct = Math.min(100, (elapsedSec / MAX_RECORDING_SEC) * 100);
+      this.dom.coachTimerBadge.textContent = `${remaining}s`;
+      this.dom.coachRecordProgress.style.width = `${pct.toFixed(1)}%`;
+    }, 200);
+
+    this.coachAutoStopTimer = setTimeout(() => {
+      if (this.isCoachRecording) {
+        this.showToast("Досягнуто ліміт запису 25 с — запис автоматично зупинено.");
+        this._stopCoachRecording();
+      }
+    }, MAX_RECORDING_SEC * 1000);
+  }
+
+  _stopCoachRecording() {
+    clearTimeout(this.coachAutoStopTimer);
+    clearInterval(this.coachTickInterval);
+    if (this.coachRecorder && this.coachRecorder.state === "recording") {
+      this.coachRecorder.stop();
+    }
+  }
+
+  async analyzeCoachRecording() {
+    if (!this.coachAudioBlob) {
+      this.showToast("Спочатку запишіть аудіофрагмент (до 25 с).", true);
+      return;
+    }
+    await this._submitAudioForAnalysis(
+      this.coachAudioBlob,
+      this.dom.aiCoachContext.value.trim(),
+      this.dom.btnCoachAnalyze,
+      "Розібрати через Gemini 4 Argon"
+    );
+  }
+
+  async analyzeLastSessionTake() {
+    // Даємо фоновому MediaRecorder мить завершити формування Blob, якщо він щойно зупинився
+    if (!this.lastSessionAudioBlob && this.bgAudioChunks.length > 0) {
+      this.lastSessionAudioBlob = new Blob(this.bgAudioChunks, {
+        type: this.bgRecorder?.mimeType || "audio/webm",
+      });
+    }
+
+    if (!this.lastSessionAudioBlob) {
+      this.showToast(
+        "Аудіодубль не знайдено (переконайтеся, що мікрофон був увімкнений під час вправи).",
+        true
+      );
+      return;
+    }
+
+    this.closeModal();
+    this.openAiCoachModal();
+    this.coachAudioBlob = this.lastSessionAudioBlob;
+    if (this.coachPreviewUrl) {
+      URL.revokeObjectURL(this.coachPreviewUrl);
+    }
+    this.coachPreviewUrl = URL.createObjectURL(this.coachAudioBlob);
+    this.dom.coachAudioPreview.src = this.coachPreviewUrl;
+    this.dom.coachAudioPreview.hidden = false;
+    this.dom.aiCoachContext.value = this.lastSessionContext;
+    this.dom.btnCoachAnalyze.disabled = false;
+
+    await this._submitAudioForAnalysis(
+      this.coachAudioBlob,
+      this.lastSessionContext,
+      this.dom.btnCoachAnalyze,
+      "Розібрати через Gemini 4 Argon"
+    );
+  }
+
+  async _submitAudioForAnalysis(blob, context, buttonEl, defaultLabel) {
+    buttonEl.disabled = true;
+    buttonEl.textContent = "Аналізуємо через Gemini 4 Argon...";
+
+    try {
+      const formData = new FormData();
+      const ext = blob.type.includes("mp4") ? "m4a" : "webm";
+      formData.append("audio", blob, `vocal-take.${ext}`);
+      formData.append("context", context || "");
+
+      const res = await fetch("/api/voice-analyze", {
+        method: "POST",
+        body: formData,
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || `HTTP ${res.status}`);
+      }
+
+      this.latestProfile = data;
+      this._renderVoiceProfile(data);
+      if (data.ai_requests_today !== null && data.ai_daily_limit !== null) {
+        this._updateAiQuotaDisplay(data.ai_requests_today, data.ai_daily_limit);
+      }
+      await this.loadStats();
+      this.showToast("Вокальний розбір від Gemini 4 Argon готовий!");
+    } catch (err) {
+      this.showToast(`Помилка аналізу: ${err.message}`, true);
+    } finally {
+      buttonEl.disabled = !this.coachAudioBlob;
+      buttonEl.textContent = defaultLabel;
+    }
+  }
+
+  _renderVoiceProfile(profile) {
+    const card = this.dom.voiceProfileCard;
+    const tensionBadge = profile.tension_detected
+      ? `<span class="vp-value vp-tension-warn">Виявлено затиск / форсування</span>`
+      : `<span class="vp-value vp-tension-ok">Звук вільний (без явного затиску)</span>`;
+
+    const tipsHtml = (profile.tips || [])
+      .map((tip) => `<li>${tip}</li>`)
+      .join("");
+
+    card.innerHTML = `
+      <div class="voice-profile-grid">
+        <div class="vp-metric">
+          <span class="vp-label">Тип голосу і тембр</span>
+          <strong class="vp-value">${profile.voice_type}</strong>
+        </div>
+        <div class="vp-metric">
+          <span class="vp-label">Діапазон</span>
+          <strong class="vp-value accent-cyan">${profile.vocal_range}</strong>
+        </div>
+        <div class="vp-metric">
+          <span class="vp-label">Перехідна зона (Passaggio)</span>
+          <strong class="vp-value accent-amber">${profile.passaggio_zone}</strong>
+        </div>
+        <div class="vp-metric">
+          <span class="vp-label">Стан гортані / затиски</span>
+          ${tensionBadge}
+        </div>
+      </div>
+      <div>
+        <span class="vp-label">Розбір опори та звуковедення</span>
+        <p class="vp-analysis-text">${profile.tension_analysis}</p>
+      </div>
+      <div>
+        <span class="vp-label">3 технічні правки</span>
+        <ol class="vp-tips-list">${tipsHtml}</ol>
+      </div>
+    `;
+  }
+
+  async generateAiExercise() {
+    const btn = this.dom.btnGenerateExercise;
+    const goal =
+      this.dom.aiGoalInput.value.trim() ||
+      "Згладжування перехідних нот та стабільна інтонація";
+
+    btn.disabled = true;
+    btn.textContent = "Генеруємо через Gemini 4...";
+
+    try {
+      const res = await fetch("/api/exercises/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ goal }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || `HTTP ${res.status}`);
+      }
+
+      this.exercises.push(data);
+      this._renderExerciseList();
+      this.selectExercise(data);
+      await this.loadStats();
+      this.showToast(`Згенеровано нову вправу: «${data.title}»`);
+    } catch (err) {
+      this.showToast(`Не вдалося згенерувати вправу: ${err.message}`, true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Згенерувати AI-розспівку";
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Демо-режим, точність та головний цикл рендерингу
+  // ---------------------------------------------------------------------------
+
   _getDemoPitch(currentTimeSec, targetEvent) {
     if (!targetEvent) {
       return {
