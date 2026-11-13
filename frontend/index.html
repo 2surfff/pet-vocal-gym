@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="uk">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vocal Gym — Студійний аудіо-тренажер</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="top-bar">
+        <div class="brand">
+          <div class="brand-logo" aria-hidden="true">VG</div>
+          <div>
+            <h1>Vocal Gym</h1>
+            <p class="brand-subtitle">Студія інтонування та слуху</p>
+          </div>
+        </div>
+
+        <div class="stats-strip" aria-label="Статистика прогресу">
+          <div class="stat-pill">
+            <span class="stat-label">Досвід</span>
+            <strong id="stat-total-xp" class="stat-value accent-cyan">0 XP</strong>
+          </div>
+          <div class="stat-pill">
+            <span class="stat-label">Стрік</span>
+            <strong id="stat-streak" class="stat-value accent-amber">0 дн.</strong>
+          </div>
+          <div class="stat-pill">
+            <span class="stat-label">Сесій</span>
+            <strong id="stat-sessions" class="stat-value">0</strong>
+          </div>
+        </div>
+      </header>
+
+      <section class="problematic-bar" aria-label="Проблемні ноти">
+        <span class="problematic-label">Ноти для повторення:</span>
+        <div id="problematic-notes-list" class="problematic-chips">
+          <span class="muted-chip">Завантаження...</span>
+        </div>
+      </section>
+
+      <main class="studio-layout">
+        <aside class="sidebar">
+          <div class="panel-header">
+            <h2>Розспівки</h2>
+            <span class="panel-hint">Оберіть вправу</span>
+          </div>
+          <div id="exercise-list" class="exercise-list"></div>
+
+          <div class="legend-card">
+            <h3>Шкала точності</h3>
+            <ul class="legend-list">
+              <li><span class="dot dot-green"></span> До 15 центів — чисто</li>
+              <li><span class="dot dot-yellow"></span> 15–35 центів — близько</li>
+              <li><span class="dot dot-red"></span> Понад 35 центів — корекція</li>
+            </ul>
+          </div>
+        </aside>
+
+        <section class="workspace">
+          <div class="exercise-header-card">
+            <div>
+              <h2 id="active-exercise-title">Оберіть вправу</h2>
+              <p id="active-exercise-desc" class="exercise-desc"></p>
+            </div>
+            <div class="exercise-meta-badges">
+              <span id="meta-difficulty" class="meta-pill">Базова</span>
+              <span id="meta-bpm" class="meta-pill">80 BPM</span>
+              <span id="meta-notes-count" class="meta-pill">0 нот</span>
+            </div>
+          </div>
+
+          <div class="controls-bar">
+            <div class="control-group">
+              <button id="btn-mic" type="button" class="btn btn-secondary">
+                Увімкнути мікрофон
+              </button>
+              <button id="btn-demo" type="button" class="btn btn-ghost" title="Симулювати голос без мікрофона">
+                Демо-симуляція
+              </button>
+              <button id="btn-preview-note" type="button" class="btn btn-ghost">
+                Тон 1-ї ноти
+              </button>
+            </div>
+
+            <div class="control-group">
+              <div class="bpm-control" title="Регулятор темпу вправи (50–160 BPM)">
+                <button id="btn-bpm-down" type="button" class="btn btn-ghost btn-compact" aria-label="Зменшити темп на 5 BPM">−5</button>
+                <button id="btn-bpm-reset" type="button" class="bpm-badge" title="Скинути темп до стандартного">
+                  <span id="bpm-value">80 BPM</span>
+                </button>
+                <button id="btn-bpm-up" type="button" class="btn btn-ghost btn-compact" aria-label="Збільшити темп на 5 BPM">+5</button>
+              </div>
+              <div class="transpose-control" title="Транспонувати вправу вгору або вниз по півтонах">
+                <button id="btn-transpose-down" type="button" class="btn btn-ghost btn-compact" aria-label="Транспонувати на 1 півтон вниз">−1 пт</button>
+                <button id="btn-transpose-reset" type="button" class="transpose-badge" title="Скинути транспозицію (0 пт)">
+                  <span id="transpose-value">0 пт</span>
+                </button>
+                <button id="btn-transpose-up" type="button" class="btn btn-ghost btn-compact" aria-label="Транспонувати на 1 півтон вгору">+1 пт</button>
+              </div>
+              <label class="toggle-label">
+                <input id="chk-metronome" type="checkbox" checked />
+                <span>Метроном під час співу</span>
+              </label>
+              <button id="btn-start-stop" type="button" class="btn btn-primary">
+                Старт вправи
+              </button>
+            </div>
+          </div>
+
+          <div class="telemetry-grid">
+            <div class="telemetry-card">
+              <div class="telemetry-row">
+                <span class="telemetry-label">Вхідний сигнал</span>
+                <span id="mic-status-text" class="telemetry-sub">Мікрофон вимкнено</span>
+              </div>
+              <div class="rms-meter">
+                <div id="rms-meter-fill" class="rms-meter-fill"></div>
+                <div id="rms-gate-marker" class="rms-gate-marker" title="Поріг Noise Gate"></div>
+              </div>
+              <div class="noise-gate-row">
+                <label for="slider-noise-gate" class="telemetry-label">Noise Gate (чутливість)</label>
+                <input
+                  id="slider-noise-gate"
+                  type="range"
+                  min="0.005"
+                  max="0.080"
+                  step="0.005"
+                  value="0.025"
+                  class="noise-gate-slider"
+                />
+                <span id="noise-gate-value" class="noise-gate-value">0.025</span>
+              </div>
+            </div>
+
+            <div class="telemetry-card tuner-card">
+              <div class="tuner-readout">
+                <div>
+                  <span class="telemetry-label">Поточна нота</span>
+                  <div class="tuner-note-row">
+                    <strong id="tuner-note" class="tuner-note">—</strong>
+                    <span id="tuner-freq" class="tuner-freq">0.0 Hz</span>
+                  </div>
+                </div>
+                <div class="tuner-right">
+                  <span id="target-note-badge" class="target-badge">Готово до старту</span>
+                  <span id="tuner-cents" class="tuner-cents">0 ¢</span>
+                </div>
+              </div>
+              <div class="tuner-bar-track">
+                <div class="tuner-center-mark"></div>
+                <div id="tuner-bar-indicator" class="tuner-bar-indicator"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="canvas-wrapper">
+            <div class="progress-track">
+              <div id="session-progress-fill" class="progress-fill"></div>
+            </div>
+            <canvas id="pitch-canvas" aria-label="Візуалізатор нотної доріжки та висоти голосу"></canvas>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div id="results-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <div class="modal-card">
+        <div class="modal-header">
+          <h2 id="modal-title">Підсумок розспівки</h2>
+          <button id="modal-close-btn" type="button" class="btn-icon" aria-label="Закрити">✕</button>
+        </div>
+
+        <div class="modal-kpis">
+          <div class="kpi-box">
+            <span class="kpi-label">Точність</span>
+            <strong id="result-score" class="kpi-value accent-green">0%</strong>
+          </div>
+          <div class="kpi-box">
+            <span class="kpi-label">Сер. відхилення</span>
+            <strong id="result-cents" class="kpi-value">±0 ¢</strong>
+          </div>
+          <div class="kpi-box">
+            <span class="kpi-label">Нараховано</span>
+            <strong id="result-xp" class="kpi-value accent-cyan">+0 XP</strong>
+          </div>
+        </div>
+
+        <p class="modal-total-xp">Загальний прогрес: <strong id="result-total-xp">0 XP</strong></p>
+
+        <div class="modal-breakdown">
+          <h3>Точність по нотах</h3>
+          <div id="result-notes-breakdown" class="modal-notes-list"></div>
+        </div>
+
+        <div class="modal-actions">
+          <button id="modal-retry-btn" type="button" class="btn btn-primary">Повторити вправу</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="status-toast" class="status-toast" role="status" aria-live="polite"></div>
+
+    <script type="module" src="/js/app.js"></script>
+  </body>
+</html>
